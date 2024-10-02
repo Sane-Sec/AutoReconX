@@ -1,0 +1,231 @@
+#!/bin/bash
+
+OUT="pentest_results"
+
+# Demander à l'utilisateur l'URL cible
+read -p "Entrez l'URL cible : " T
+
+# Vérifier si le répertoire de sortie existe, sinon le créer
+if [ ! -d "$OUT" ]; then
+  mkdir -p "$OUT"
+fi
+
+# Menu pour sélectionner les phases de PenTest
+echo "Sélectionnez les phases de la méthodologie de PenTest à exécuter :"
+echo "1. Extraction des commentaires du code source"
+echo "2. Scan de répertoires"
+echo "3. Recherche et vérification des sous-domaines"
+echo "4. Informations DNS"
+echo "5. Informations sur les technologies (WhatWeb)"
+echo "6. Scan SSL"
+echo "7. Scan OWASP ZAP"
+echo "8. Exécuter toutes les phases"
+read -p "Entrez votre choix (1, 2, 3, 4, 5, 6, 7, 8) : " V
+
+# Fonction pour l'extraction des commentaires du code source avec wget et awk
+extract_comments() {
+    echo "[*] Extraction des commentaires du code source de $T ..."
+    output_file="$OUT/comments.txt"
+    temp_file="$OUT/temp.html"
+
+    # Utiliser wget pour obtenir le code source
+    wget -q -O "$temp_file" "$T"
+
+    # Extraire uniquement les commentaires HTML
+    awk '
+      BEGIN { in_comment = 0 }
+      /<!--/ { in_comment = 1 }
+      in_comment { print }
+      /-->/ { in_comment = 0 }
+    ' "$temp_file" > "$output_file"
+
+    # Supprimer le fichier temporaire
+    rm "$temp_file"
+
+    # Vérifier si des commentaires ont été trouvés
+    if [ -s "$output_file" ]; then
+        echo "[*] Commentaires extraits et sauvegardés dans $output_file"
+    else
+        echo "[*] Aucun commentaire trouvé dans le code source."
+        rm "$output_file" # Supprimer le fichier vide
+    fi
+}
+
+# Fonction pour le scan de répertoires avec ffuf
+directory_enum() {
+    local target=$T
+    local wordlist="/usr/share/wordlists/dirb/common.txt"
+    local output_file="$OUT/scan_ffuf.txt"
+    echo -e "\n[+] Recherche des répertoires..."
+
+    # Commande ffuf
+    local result=$(ffuf -u http://$target/FUZZ -w $wordlist -mc 200,301,302 -fs 0)
+
+    local directories=()
+
+    # Extraction des répertoires trouvés
+    while IFS= read -r line; do
+        if [[ "$line" =~ 301|302|200 ]]; then
+            directory=$(echo $line | awk '{print $1}')
+            # Exclusion des répertoires contenant ".perf"
+            if [[ "$directory" != *".perf"* ]]; then
+                directories+=("http://$target/$directory")
+            fi
+        fi
+    done <<< "$result"
+
+    echo "[+] Répertoires trouvés:" > "$output_file"
+    for dir in "${directories[@]}"; do
+        echo "$dir" >> "$output_file"
+    done
+
+    echo "[+] Résultats sauvegardés dans $output_file"
+
+    # Nettoyage du fichier de sortie
+    sed -e 's|\[2K||g' -e '/^$/d' "$output_file" | tr -d '\r' | tr -d '\033' > temp_output.txt
+    mv temp_output.txt "$output_file"
+}
+
+# Fonction pour la recherche et la vérification des sous-domaines
+scan_subdomains() {
+    echo "[*] Recherche des sous-domaines pour $T ..."
+    SUBDOMAINS_FILE="$OUT/subdomains.txt"
+    ACTIVE_SUBDOMAINS_FILE="$OUT/active_subdomains.txt"
+    > $SUBDOMAINS_FILE
+    > $ACTIVE_SUBDOMAINS_FILE
+    assetfinder $T > $SUBDOMAINS_FILE
+    echo "[*] Vérification des sous-domaines actifs..."
+
+    while read -r SUBDOMAIN; do
+        FULL_URL="http://$SUBDOMAIN"
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" $FULL_URL)
+
+        if [ "$RESPONSE" == "200" ] || [ "$RESPONSE" == "301" ] || [ "$RESPONSE" == "302" ]; then
+            echo "$SUBDOMAIN est actif ($RESPONSE)"
+            echo "$SUBDOMAIN" >> $ACTIVE_SUBDOMAINS_FILE
+        else
+            echo "$SUBDOMAIN n'est pas actif ($RESPONSE)"
+        fi
+    done < $SUBDOMAINS_FILE
+
+    echo "[*] Sous-domaines actifs sauvegardés dans $ACTIVE_SUBDOMAINS_FILE"
+}
+
+# Fonction pour obtenir des informations DNS sur les serveurs de noms
+dns_info() {
+    echo "[*] Récupération des informations DNS pour $T ..."
+    output_file="$OUT/dns_info.txt"
+
+    # Utiliser dig pour obtenir les enregistrements NS
+    dig -t ns "$T" > "$output_file"
+
+    if [ -s "$output_file" ]; then
+        echo "[*] Informations DNS récupérées et sauvegardées dans $output_file"
+    else
+        echo "[*] Aucune information DNS trouvée."
+        rm "$output_file" # Supprimer le fichier vide
+    fi
+}
+
+# Fonction pour l'analyse des technologies avec WhatWeb
+whatweb_scan() {
+    echo "[*] Scan des technologies utilisées sur $T avec WhatWeb..."
+    output_file="$OUT/whatweb.txt"
+
+    # Utiliser WhatWeb pour collecter les informations sur les technologies
+    whatweb $T > "$output_file"
+
+    if [ -s "$output_file" ]; then
+        echo "[*] Scan WhatWeb terminé et sauvegardé dans $output_file"
+    else
+        echo "[*] Aucune information trouvée avec WhatWeb."
+        rm "$output_file" # Supprimer le fichier vide
+    fi
+}
+
+# Fonction pour le scan SSL avec sslscan
+ssl_scan() {
+    echo "[*] Exécution du scan SSL sur $T ..."
+    output_file="$OUT/ssl_scan.txt"
+
+    # Exécuter sslscan
+    sslscan "$T" > "$output_file"
+
+    if [ -s "$output_file" ]; then
+        echo "[*] Scan SSL terminé et sauvegardé dans $output_file"
+    else
+        echo "[*] Aucune information SSL trouvée."
+        rm "$output_file" # Supprimer le fichier vide
+    fi
+}
+
+# Fonction pour le scan avec OWASP ZAP
+zap_scan() {
+    echo "[*] Démarrage de ZAP en mode démon..."
+    zaproxy -daemon -port 8080
+
+    echo "[*] Lancement du scan avec ZAP sur $T ..."
+    curl "http://localhost:8080/JSON/ascan/action/scan/?url=http://$T&recurse=true"
+
+    echo "[*] Attente de la fin du scan..."
+    sleep 60 # Temps d'attente pour le scan; ajuste en fonction de la taille du site
+
+    echo "[*] Récupération des résultats du scan..."
+    curl "http://localhost:8080/JSON/core/view/siteMaps/?baseurl=http://$T" > "$OUT/zap_scan_results.json"
+
+    if [ -s "$OUT/zap_scan_results.json" ]; then
+        echo "[*] Résultats du scan ZAP sauvegardés dans $OUT/zap_scan_results.json"
+    else
+        echo "[*] Aucun résultat trouvé avec ZAP."
+    fi
+
+    # Arrêter ZAP
+    echo "[*] Arrêt de ZAP..."
+    curl "http://localhost:8080/JSON/core/action/shutdown/"
+}
+
+# Exécution des phases en fonction du choix de l'utilisateur
+case $V in
+    1)
+        extract_comments
+        ;;
+    2)
+        directory_enum
+        ;;
+    3)
+        scan_subdomains
+        ;;
+    4)
+        dns_info
+        ;;
+    5)
+        whatweb_scan
+        ;;
+    6)
+        ssl_scan
+        ;;
+    7)
+        zap_scan
+        ;;
+    8)
+        extract_comments
+        directory_enum
+        scan_subdomains
+        dns_info
+        whatweb_scan
+        ssl_scan
+        zap_scan
+        ;;
+    *)
+        echo "Choix invalide. Exécution annulée."
+        exit 1
+        ;;
+esac
+
+# Compilation des rapports si toutes les phases ont été exécutées
+if [ "$V" -eq 8 ]; then
+    echo "Compilation de tous les rapports dans $OUT/combined_report.txt"
+    {
+        echo "Rapport des Commentaires Extraits :"
+        cat $OUT/comments.txt
+        echo -e "\n\nRapport de Scan
